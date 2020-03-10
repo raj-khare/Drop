@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Drop</title>
+    <link
+      rel="stylesheet"
+      href="https://bootswatch.com/4/lux/bootstrap.min.css"
+    />
+  </head>
+  <body>
+    <div
+      class="card text-white bg-dark mb-3 mx-auto mt-5"
+      style="max-width: 20rem;"
+    >
+      <div class="card-header">DROP INC.</div>
+      <div class="card-body">
+        <h4 class="card-title">DROP</h4>
+        <p class="card-text">
+          Met with an accident? Request ambulance drone right now with a touch
+          of a button.
+        </p>
+      </div>
+      <button type="button" class="btn btn-secondary" onclick="getGPS()">
+        Request
+      </button>
+    </div>
+
+    <script>
+      function getGPS() {
+        if (navigator.geolocation) {
+          navigator.geolocation.getCurrentPosition(position => {
+            post("/request", {
+              latitude: position.coords.latitude,
+              longitude: position.coords.longitude
+            });
+          });
+        } else {
+          alert("Geolocation is not supported by this browser.");
+        }
+      }
+
+      function post(path, params, method = "post") {
+        const form = document.createElement("form");
+        form.method = method;
+        form.action = path;
+
+        for (const key in params) {
+          if (params.hasOwnProperty(key)) {
+            const hiddenField = document.createElement("input");
+            hiddenField.type = "hidden";
+            hiddenField.name = key;
+            hiddenField.value = params[key];
+
+            form.appendChild(hiddenField);
+          }
+        }
+
+        document.body.appendChild(form);
+        form.submit();
+      }
+    </script>
+  </body>
+</html>
