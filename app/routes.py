@@ -6,12 +6,25 @@ import dronekit_sitl
 from app import celery
 from requests import post
 from flask_socketio import emit
+import threading
+
+SITL = 'tcp:127.0.0.1:5760'
 
 
 @celery.task
-def deploy_drone_async(sid, url):
+def send_live_gps(sid, gps_url, drone):
+    i = 0
+    while i < 10:
+        post(gps_url, json={
+             'gps': drone.location.global_frame.alt, 'sid': sid})
+        i += 1
+        time.sleep(1)
+
+
+@celery.task
+def deploy_drone_async(latitude, longitude, sid, status_url, gps_url, ip_addr):
     def notify(msg):
-        post(url, json={'status': msg, 'sid': sid})
+        post(status_url, json={'status': msg, 'sid': sid})
 
     def arm_and_takeoff(altitude):
         notify("Basic pre-arm checks")
@@ -44,16 +57,16 @@ def deploy_drone_async(sid, url):
                 break
             time.sleep(1)
 
-    sitl = dronekit_sitl.start_default()
-    connection_string = sitl.connection_string()
-    notify(f'Connecting to vehicle on: {connection_string}')
-    drone = connect(connection_string, wait_ready=True)
+    notify(f'Connecting to vehicle on: {ip_addr}')
+    drone = connect(ip_addr, wait_ready=True)
+    send_live_gps.apply_async(args=[sid, gps_url, drone], serializer="pickle")
+
     arm_and_takeoff(10)
     notify("Set default/target airspeed to 3")
     drone.airspeed = 3
 
     notify("Going towards first point for 30 seconds ...")
-    point1 = LocationGlobalRelative(-35.361354, 149.165218, 20)
+    point1 = LocationGlobalRelative(latitude, longitude, 20)
     drone.simple_goto(point1)
 
     # sleep so we can see the change in map
@@ -66,15 +79,14 @@ def deploy_drone_async(sid, url):
     notify("Close vehicle object")
     drone.close()
 
-    # Shut down simulator if it was started.
-    if sitl:
-        sitl.stop()
-
 
 @socketio.on('deploy_drone')
-def deploy_drone():
-    task = deploy_drone_async.delay(
-        request.sid, url_for('status', _external=True))
+def deploy_drone(gps):
+    assert gps.get('latitude') and gps.get('longitude')
+
+    deploy_drone_async.delay(
+        gps['latitude'], gps['longitude'],
+        request.sid, url_for('status', _external=True), url_for('gps', _external=True), SITL)
 
 
 @app.route('/status', methods=['POST'])
@@ -85,12 +97,12 @@ def status():
     return 'OK'
 
 
-@app.route('/request', methods=['POST'])
-def request_drone():
-    latitude, longitude = request.form.get(
-        'latitude', None), request.form.get('longitude', None)
-    assert latitude and longitude
-    return render_template('request.html', latitude=latitude, longitude=longitude)
+@app.route('/gps', methods=['POST'])
+def gps():
+    sid = request.json['sid']
+    gps = request.json['gps']
+    emit('live_gps', gps, room=sid, namespace='/')
+    return 'OK'
 
 
 @app.route('/')
