@@ -1,108 +1,122 @@
 from app import app, socketio
-from flask import render_template, request, url_for
+from flask import render_template, request
 import time
-from dronekit import connect, VehicleMode, LocationGlobalRelative
+from dronekit import connect, VehicleMode, LocationGlobalRelative, LocationGlobal
 import dronekit_sitl
-from app import celery
-from requests import post
 from flask_socketio import emit
-import threading
+from threading import Thread
 
 SITL = 'tcp:127.0.0.1:5760'
 
 
-@celery.task
-def send_live_gps(sid, gps_url, drone):
-    i = 0
-    while i < 10:
-        post(gps_url, json={
-             'gps': drone.location.global_frame.alt, 'sid': sid})
-        i += 1
-        time.sleep(1)
+class Drone(object):
+    def __init__(self, vehicle, sid):
+        self.gps_lock = False
+        self.altitude = 10.0
+        self.sid = sid
 
+        # Connect to the Vehicle
+        self._log('Connected to vehicle.')
+        self.vehicle = vehicle
+        self.vehicle.airspeed = 10000
+        self.commands = self.vehicle.commands
+        self.current_coords = []
+        self._log("DroneDelivery Start")
 
-@celery.task
-def deploy_drone_async(latitude, longitude, sid, status_url, gps_url, ip_addr):
-    def notify(msg):
-        post(status_url, json={'status': msg, 'sid': sid})
+        # Register observers
+        self.vehicle.add_attribute_listener('location', self.location_callback)
 
-    def arm_and_takeoff(altitude):
-        notify("Basic pre-arm checks")
-        # Don't try to arm until autopilot is ready
-        while not drone.is_armable:
-            notify(" Waiting for vehicle to initialise...")
+    def launch(self):
+        self._log("Waiting for location...")
+        while self.vehicle.location.global_frame.lat == 0:
+            time.sleep(0.1)
+        self.home_coords = [self.vehicle.location.global_frame.lat,
+                            self.vehicle.location.global_frame.lon]
+
+        self._log("Waiting for ability to arm...")
+        while not self.vehicle.is_armable:
+            time.sleep(.1)
+
+        self._log('Running initial boot sequence')
+        self.change_mode('GUIDED')
+        self.arm()
+        self.takeoff()
+        time.sleep(30)
+
+    def takeoff(self):
+        self._log("Taking off")
+        self.vehicle.simple_takeoff(30.0)
+
+    def arm(self, value=True):
+        if value:
+            self._log('Waiting for arming...')
+            self.vehicle.armed = True
+            while not self.vehicle.armed:
+                time.sleep(.1)
+        else:
+            self._log("Disarming!")
+            self.vehicle.armed = False
+
+    def change_mode(self, mode):
+        self._log("Changing to mode: {0}".format(mode))
+
+        self.vehicle.mode = VehicleMode(mode)
+        while self.vehicle.mode.name != mode:
+            self._log('  ... polled mode: {0}'.format(mode))
             time.sleep(1)
 
-        notify("Arming motors")
-        # Copter should arm in GUIDED mode
-        drone.mode = VehicleMode("GUIDED")
-        drone.armed = True
+    def goto(self, location, relative=None):
+        self._log("Goto: {0}, {1}".format(location, self.altitude))
 
-        # Confirm drone armed before attempting to take off
-        while not drone.armed:
-            notify(" Waiting for arming...")
-            time.sleep(1)
+        if relative:
+            self.vehicle.simple_goto(
+                LocationGlobalRelative(
+                    float(location[0]), float(location[1]),
+                    float(self.altitude)
+                )
+            )
+        else:
+            self.vehicle.simple_goto(
+                LocationGlobal(
+                    float(location[0]), float(location[1]),
+                    float(self.altitude)
+                )
+            )
+        self.vehicle.flush()
 
-        notify("Taking off!")
-        drone.simple_takeoff(altitude)  # Take off to target altitude
+    def get_location(self):
+        return [self.current_location.lat, self.current_location.lon]
 
-        # Wait until the vehicle reaches a safe height before processing the goto
-        #  (otherwise the command after Vehicle.simple_takeoff will execute
-        #   immediately).
-        while True:
-            notify(f"Altitude: {drone.location.global_relative_frame.alt}")
-            # Break and return from function just below target altitude.
-            if drone.location.global_relative_frame.alt >= altitude * 0.95:
-                notify("Reached target altitude")
-                break
-            time.sleep(1)
+    def location_callback(self, vehicle, name, location):
+        if location.global_relative_frame.alt is not None:
+            self.altitude = location.global_relative_frame.alt
 
-    notify(f'Connecting to vehicle on: {ip_addr}')
-    drone = connect(ip_addr, wait_ready=True)
-    send_live_gps.apply_async(args=[sid, gps_url, drone], serializer="pickle")
+        self.current_location = location.global_relative_frame
+        with app.app_context():
+            emit('live_gps', {'lat': self.current_location.lat, 'lon': self.current_location.lon},
+                 room=self.sid, namespace='/')
 
-    arm_and_takeoff(10)
-    notify("Set default/target airspeed to 3")
-    drone.airspeed = 3
+    def _log(self, message):
+        with app.app_context():
+            emit('drone_status', message, room=self.sid, namespace='/')
 
-    notify("Going towards first point for 30 seconds ...")
-    point1 = LocationGlobalRelative(latitude, longitude, 20)
-    drone.simple_goto(point1)
 
-    # sleep so we can see the change in map
-    time.sleep(30)
+def deploy_drone_async(drone, user_lat, user_lon, sid):
 
-    notify("Returning to Launch")
-    drone.mode = VehicleMode("RTL")
-
-    # Close vehicle object before exiting script
-    notify("Close vehicle object")
-    drone.close()
+    drone.launch()
+    drone.goto((user_lat, user_lon), True)
 
 
 @socketio.on('deploy_drone')
 def deploy_drone(gps):
     assert gps.get('latitude') and gps.get('longitude')
+    _drone = connect(SITL, wait_ready=True)
+    drone = Drone(_drone, request.sid)
 
-    deploy_drone_async.delay(
-        gps['latitude'], gps['longitude'],
-        request.sid, url_for('status', _external=True), url_for('gps', _external=True), SITL)
-
-
-@app.route('/status', methods=['POST'])
-def status():
-    sid = request.json['sid']
-    status = request.json['status']
-    emit('drone_status', status, room=sid, namespace='/')
-    return 'OK'
-
-
-@app.route('/gps', methods=['POST'])
-def gps():
-    sid = request.json['sid']
-    gps = request.json['gps']
-    emit('live_gps', gps, room=sid, namespace='/')
-    return 'OK'
+    deployment_thread = Thread(target=deploy_drone_async, args=(
+        drone, gps['latitude'], gps['longitude'], request.sid))
+    deployment_thread.daemon = True
+    deployment_thread.start()
 
 
 @app.route('/')

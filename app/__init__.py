@@ -1,17 +1,16 @@
+# import eventlet
+from gevent import monkey
 from flask import Flask
 from flask_socketio import SocketIO
-from celery import Celery
 
 app = Flask(__name__)
-app.clients = {}
 app.config['SECRET_KEY'] = 'hmmm..'
+# async_mode = 'eventlet'
+async_mode = 'gevent'
+# eventlet.monkey_patch()
+monkey.patch_all()
 
-# Celery stuff
-app.config['CELERY_BROKER_URL'] = 'redis://localhost:6379/0'
-app.config['CELERY_RESULT_BACKEND'] = 'redis://localhost:6379/0'
-celery = Celery(app.name, broker=app.config['CELERY_BROKER_URL'])
-celery.conf.update(app.config)
 
-socketio = SocketIO(app)
+socketio = SocketIO(app, async_mode=async_mode)
 
 from app import routes  # nopep8
